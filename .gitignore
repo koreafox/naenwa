@@ -1,0 +1,23 @@
+# Gradle
+.gradle/
+build/
+!gradle/wrapper/gradle-wrapper.jar
+
+# Android Studio
+*.iml
+.idea/
+local.properties
+
+# Signing
+*.jks
+*.keystore
+keystore.properties
+
+# Generated
+app/release/
+*.apk
+*.aab
+
+# OS
+.DS_Store
+Thumbs.db

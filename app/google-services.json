@@ -1,0 +1,47 @@
+{
+  "project_info": {
+    "project_number": "939750314714",
+    "project_id": "naenwa-a91a8",
+    "storage_bucket": "naenwa-a91a8.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:939750314714:android:ca621dad9313e0e496cbe3",
+        "android_client_info": {
+          "package_name": "com.naenwa.remote"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "939750314714-6pnctb6a2cmttgtv9qm6a657nit164n8.apps.googleusercontent.com",
+          "client_type": 1,
+          "android_info": {
+            "package_name": "com.naenwa.remote",
+            "certificate_hash": "5deb40eb5d79b008f0809ee442c7bd8bfd6e0a5c"
+          }
+        },
+        {
+          "client_id": "939750314714-qp4q05ablp3milag2fhp0ivktaiusade.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyC9syll3_ghFab7zMG77AJ0UcogM01XtaM"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "939750314714-qp4q05ablp3milag2fhp0ivktaiusade.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}

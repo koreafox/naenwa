@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<paths>
+    <!-- APK 다운로드 임시 파일 경로 -->
+    <cache-path
+        name="apk_cache"
+        path="/" />
+</paths>
