@@ -76,6 +76,12 @@
             android:exported="false"
             android:theme="@style/Theme.NaenwaRemote" />
 
+        <!-- WebContainer Test Activity -->
+        <activity
+            android:name=".WebContainerTestActivity"
+            android:exported="false"
+            android:theme="@style/Theme.NaenwaRemote" />
+
         <!-- 플로팅 버튼 서비스 (백그라운드 연결 유지) -->
         <service
             android:name=".service.FloatingService"

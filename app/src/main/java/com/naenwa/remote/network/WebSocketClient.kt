@@ -32,8 +32,13 @@ class WebSocketClient(val serverUrl: String) {
     private var webSocket: WebSocket? = null
     private var reconnectAttempts = 0
     private var shouldReconnect = true
-    private val maxReconnectAttempts = 5
+    private val maxReconnectAttempts = 10  // 5 → 10으로 증가
     private val scope = CoroutineScope(Dispatchers.IO + SupervisorJob())
+
+    // 세션 복구를 위한 정보 저장
+    private var lastSessionId: String? = null
+    private var lastClaudeSessionId: String? = null
+    private var reconnectJob: Job? = null
 
     // 시그널링 클라이언트 (WebRTC용)
     private var _signalingClient: WebSocketSignalingClient? = null
@@ -50,6 +55,7 @@ class WebSocketClient(val serverUrl: String) {
         object Disconnected : ConnectionState()
         object Connecting : ConnectionState()
         object Connected : ConnectionState()
+        data class Reconnecting(val attempt: Int, val maxAttempts: Int, val delayMs: Long) : ConnectionState()
         data class Error(val message: String) : ConnectionState()
     }
 
@@ -141,7 +147,11 @@ class WebSocketClient(val serverUrl: String) {
     private fun parseMessage(json: JsonObject): ServerMessage? {
         return try {
             when (json.get("type")?.asString) {
-                "connected" -> ServerMessage.Connected(json.get("session_id")?.asString ?: "")
+                "connected" -> {
+                    val sessionId = json.get("session_id")?.asString ?: ""
+                    lastSessionId = sessionId  // 세션 ID 저장 (재연결 시 사용)
+                    ServerMessage.Connected(sessionId)
+                }
                 "system" -> ServerMessage.System(json.get("message")?.asString ?: "")
                 "claude_output" -> ServerMessage.ClaudeOutput(json.get("text")?.asString ?: "")
                 "tool_use" -> ServerMessage.ToolUse(
@@ -168,6 +178,7 @@ class WebSocketClient(val serverUrl: String) {
                 "session_id" -> {
                     val claudeSessionId = json.get("claude_session_id")?.asString ?: ""
                     if (claudeSessionId.isNotEmpty()) {
+                        lastClaudeSessionId = claudeSessionId  // Claude 세션 ID 저장
                         ServerMessage.ClaudeSessionId(claudeSessionId)
                     } else null
                 }
@@ -281,22 +292,57 @@ class WebSocketClient(val serverUrl: String) {
     }
 
     /**
-     * Exponential backoff 재연결 (1s, 2s, 4s, 8s, 16s)
+     * 개선된 재연결 로직:
+     * - 처음 10번: Exponential backoff (1s, 2s, 4s, ..., 최대 30s)
+     * - 10번 이후: 30초마다 계속 시도 (무한)
      */
     private suspend fun attemptReconnect() {
-        if (!shouldReconnect || reconnectAttempts >= maxReconnectAttempts) {
-            Log.d(TAG, "Reconnect stopped: shouldReconnect=$shouldReconnect, attempts=$reconnectAttempts")
+        if (!shouldReconnect) {
+            Log.d(TAG, "Reconnect stopped: shouldReconnect=$shouldReconnect")
             return
         }
 
-        reconnectAttempts++
-        val delayMs = (1000L * (1 shl (reconnectAttempts - 1))).coerceAtMost(16000L)
-        Log.d(TAG, "Reconnecting in ${delayMs}ms (attempt $reconnectAttempts/$maxReconnectAttempts)")
+        // 이전 재연결 작업 취소
+        reconnectJob?.cancel()
 
-        kotlinx.coroutines.delay(delayMs)
+        reconnectJob = scope.launch {
+            reconnectAttempts++
 
-        if (shouldReconnect) {
-            connect()
+            // Exponential backoff (최대 30초)
+            val delayMs = if (reconnectAttempts <= maxReconnectAttempts) {
+                (1000L * (1 shl (reconnectAttempts - 1))).coerceAtMost(30000L)
+            } else {
+                // 10번 이후에는 30초마다 계속 시도
+                30000L
+            }
+
+            Log.d(TAG, "Reconnecting in ${delayMs}ms (attempt $reconnectAttempts)")
+
+            // 재연결 상태 전달 (UI 표시용)
+            _connectionState.emit(
+                ConnectionState.Reconnecting(
+                    attempt = reconnectAttempts,
+                    maxAttempts = maxReconnectAttempts,
+                    delayMs = delayMs
+                )
+            )
+
+            delay(delayMs)
+
+            if (shouldReconnect) {
+                Log.d(TAG, "Attempting reconnect...")
+                connect()
+
+                // 재연결 성공 시 세션 복구
+                delay(1000) // 연결 확립 대기
+                if (lastSessionId != null || lastClaudeSessionId != null) {
+                    Log.d(TAG, "Restoring session: $lastSessionId, Claude: $lastClaudeSessionId")
+                    resumeSession(
+                        lastSessionId ?: "",
+                        lastClaudeSessionId
+                    )
+                }
+            }
         }
     }
 

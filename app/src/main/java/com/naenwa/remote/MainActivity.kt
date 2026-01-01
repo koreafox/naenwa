@@ -74,9 +74,6 @@ class MainActivity : AppCompatActivity() {
     // 서버 URL
     private var serverUrl: String = ""
 
-    // 로컬 개발 모드
-    private var isLocalMode: Boolean = false
-
     // FloatingService 없이 직접 연결한 경우의 클라이언트
     private var directWebSocketClient: WebSocketClient? = null
 
@@ -104,11 +101,14 @@ class MainActivity : AppCompatActivity() {
     // 채팅 메시지 리스트
     private val chatMessages = mutableListOf<ChatDisplayMessage>()
 
-    // 스트리밍 텍스트 배치 처리 (50ms 단위로 모아서 업데이트)
+    // 스트리밍 텍스트 배치 처리 (동적 간격 조절)
     private val streamBuffer = StringBuilder()
     private val streamHandler = android.os.Handler(android.os.Looper.getMainLooper())
     private var streamPending = false
     private var currentStreamingMessageId: Long = -1
+    private var streamFlushDelayMs = 50L  // 기본 50ms, 동적으로 조절
+    private var lastFlushTime = 0L
+    private var streamBytesPerSecond = 0
 
     // 사용자가 맨 아래에 있는지 추적 (자동 스크롤 결정용)
     private var isUserAtBottom = true
@@ -195,17 +195,6 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun checkAuthAndConnect() {
-        // 로컬 모드 설정 로드
-        isLocalMode = loadLocalModePreference()
-
-        if (isLocalMode) {
-            // 로컬 모드 - 인증 없이 localhost에 연결
-            appendLog("[로컬 모드] Termux 서버에 연결 중...")
-            serverUrl = "ws://localhost:8765"
-            connectToServer(serverUrl)
-            return
-        }
-
         // 1. Google 로그인 확인
         if (!authManager.isLoggedIn) {
             appendLog("로그인이 필요합니다. 터치하여 로그인하세요.")
@@ -574,9 +563,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun showSettingsDialog() {
-        val localModeText = if (isLocalMode) "로컬 모드 끄기" else "로컬 모드 켜기"
         val items = arrayOf(
-            localModeText,
             "QR 코드로 기기 추가",
             "서버 URL 직접 입력",
             "로그아웃"
@@ -586,43 +573,12 @@ class MainActivity : AppCompatActivity() {
             .setTitle("설정")
             .setItems(items) { _, which ->
                 when (which) {
-                    0 -> toggleLocalMode()
-                    1 -> startQrScanner()
-                    2 -> showServerUrlDialog()
-                    3 -> signOut()
+                    0 -> startQrScanner()
+                    1 -> showServerUrlDialog()
+                    2 -> signOut()
                 }
             }
             .show()
-    }
-
-    private fun toggleLocalMode() {
-        isLocalMode = !isLocalMode
-        saveLocalModePreference(isLocalMode)
-
-        if (isLocalMode) {
-            // 로컬 모드 - localhost에 연결
-            appendLog("[로컬 모드] 활성화됨 - Termux 서버에 연결")
-            serverUrl = "ws://localhost:8765"
-            saveServerUrl(serverUrl)
-            connectToServer(serverUrl)
-        } else {
-            // 원격 모드 - 기존 방식으로 연결
-            appendLog("[원격 모드] 활성화됨")
-            disconnect()
-            fetchDevicesAndConnect()
-        }
-    }
-
-    private fun saveLocalModePreference(enabled: Boolean) {
-        getSharedPreferences("naenwa", Context.MODE_PRIVATE)
-            .edit()
-            .putBoolean("local_mode", enabled)
-            .apply()
-    }
-
-    private fun loadLocalModePreference(): Boolean {
-        return getSharedPreferences("naenwa", Context.MODE_PRIVATE)
-            .getBoolean("local_mode", false)
     }
 
     private fun startQrScanner() {
@@ -884,33 +840,14 @@ class MainActivity : AppCompatActivity() {
 
         // Git 푸시 버튼
         binding.btnGitPush.setOnClickListener {
-            showGitPushDialog()
-        }
-    }
-
-    private fun showGitPushDialog() {
-        val client = FloatingService.webSocketClient ?: directWebSocketClient
-        if (client == null) {
-            Toast.makeText(this, "먼저 서버에 연결하세요", Toast.LENGTH_SHORT).show()
-            return
-        }
-
-        val input = android.widget.EditText(this).apply {
-            hint = "커밋 메시지 (선택사항)"
-            setPadding(50, 30, 50, 30)
-        }
-
-        AlertDialog.Builder(this)
-            .setTitle("Git Push")
-            .setMessage("변경사항을 커밋하고 푸시합니다.")
-            .setView(input)
-            .setPositiveButton("Push") { _, _ ->
-                val message = input.text.toString().trim().ifEmpty { "Update from Naenwa" }
-                client.requestGitPush(message)
-                appendLog("[Git] 푸시 요청: $message")
+            val client = FloatingService.webSocketClient ?: directWebSocketClient
+            if (client == null) {
+                Toast.makeText(this, "먼저 서버에 연결하세요", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
             }
-            .setNegativeButton("취소", null)
-            .show()
+            client.requestGitPush("Update from Naenwa")
+            Toast.makeText(this, "푸시 중...", Toast.LENGTH_SHORT).show()
+        }
     }
 
     private fun showLoading(show: Boolean) {
@@ -941,8 +878,6 @@ class MainActivity : AppCompatActivity() {
         service.onConnectionStateChanged = { connected ->
             if (connected) {
                 appendLog("연결됨!")
-                // 저장소 동기화 (clone 또는 pull)
-                FloatingService.webSocketClient?.let { requestGitCloneIfNeeded(it) }
             } else {
                 appendLog("연결 끊김")
             }
@@ -970,11 +905,18 @@ class MainActivity : AppCompatActivity() {
                         updateConnectionUI(true)
                         // 세션 복원 (Claude 세션 ID 포함)
                         serverSessionId?.let { client.resumeSession(it, currentClaudeSessionId) }
-                        // 저장소 동기화 (clone 또는 pull)
-                        requestGitCloneIfNeeded(client)
                     }
                     is WebSocketClient.ConnectionState.Disconnected -> {
                         appendLog("연결 끊김")
+                        updateConnectionUI(false)
+                    }
+                    is WebSocketClient.ConnectionState.Reconnecting -> {
+                        val delaySeconds = state.delayMs / 1000
+                        if (state.attempt <= state.maxAttempts) {
+                            appendLog("재연결 시도 ${state.attempt}/${state.maxAttempts} (${delaySeconds}초 후)")
+                        } else {
+                            appendLog("재연결 시도 중... (${delaySeconds}초 후)")
+                        }
                         updateConnectionUI(false)
                     }
                     is WebSocketClient.ConnectionState.Error -> {
@@ -1026,13 +968,10 @@ class MainActivity : AppCompatActivity() {
                 appendLog("[빌드] ${message.text}", type = MessageType.BUILD_LOG)
             }
             is WebSocketClient.ServerMessage.GitStatus -> {
-                val emoji = when (message.status) {
-                    "complete" -> "✅"
-                    "error" -> "❌"
-                    "progress" -> "⏳"
-                    else -> "📦"
+                when (message.status) {
+                    "complete" -> Toast.makeText(this, "✅ ${message.message}", Toast.LENGTH_SHORT).show()
+                    "error" -> Toast.makeText(this, "❌ ${message.message}", Toast.LENGTH_LONG).show()
                 }
-                appendLog("[Git] $emoji ${message.message}")
             }
             is WebSocketClient.ServerMessage.System -> {
                 appendLog("[시스템] ${message.message}")
@@ -1157,6 +1096,7 @@ class MainActivity : AppCompatActivity() {
             // 새 스트리밍 메시지 시작
             if (currentStreamingMessageId == -1L) {
                 currentStreamingMessageId = System.currentTimeMillis()
+                lastFlushTime = System.currentTimeMillis()
                 val message = ChatDisplayMessage(
                     id = currentStreamingMessageId,
                     type = MessageType.CLAUDE_OUTPUT,
@@ -1167,11 +1107,19 @@ class MainActivity : AppCompatActivity() {
 
             streamBuffer.append(text)
 
+            // 동적 flush 간격 조절
+            // 버퍼 크기에 따라 조절: 큰 데이터는 빨리 flush (30ms), 작은 데이터는 천천히 (100ms)
+            streamFlushDelayMs = when {
+                streamBuffer.length > 500 -> 30L  // 많은 데이터: 빠르게
+                streamBuffer.length > 100 -> 50L  // 중간: 기본값
+                else -> 100L                       // 적은 데이터: 천천히 (깜박임 방지)
+            }
+
             if (!streamPending) {
                 streamPending = true
                 streamHandler.postDelayed({
                     flushStreamBuffer()
-                }, 50)
+                }, streamFlushDelayMs)
             }
         }
     }

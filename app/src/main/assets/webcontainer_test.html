@@ -1,0 +1,200 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>WebContainers Test</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+        body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+            background: #1a1a1a;
+            color: #fff;
+            padding: 16px;
+            min-height: 100vh;
+        }
+        h1 {
+            font-size: 18px;
+            margin-bottom: 16px;
+            color: #4ade80;
+        }
+        #status {
+            padding: 12px;
+            background: #2a2a2a;
+            border-radius: 8px;
+            margin-bottom: 16px;
+            font-size: 14px;
+        }
+        #terminal {
+            background: #000;
+            border-radius: 8px;
+            padding: 12px;
+            font-family: 'Courier New', monospace;
+            font-size: 13px;
+            min-height: 300px;
+            overflow-y: auto;
+            white-space: pre-wrap;
+            word-break: break-all;
+        }
+        .success { color: #4ade80; }
+        .error { color: #f87171; }
+        .info { color: #60a5fa; }
+        button {
+            background: #4ade80;
+            color: #000;
+            border: none;
+            padding: 12px 24px;
+            border-radius: 8px;
+            font-size: 14px;
+            font-weight: bold;
+            margin-top: 16px;
+            width: 100%;
+        }
+    </style>
+</head>
+<body>
+    <h1>🧪 WebContainers 테스트</h1>
+    <div id="status">상태: 초기화 중...</div>
+    <div id="terminal"></div>
+    <button onclick="runTest()">테스트 실행</button>
+
+    <script type="module">
+        import { WebContainer } from 'https://esm.sh/@webcontainer/api';
+
+        const statusEl = document.getElementById('status');
+        const terminalEl = document.getElementById('terminal');
+
+        let webcontainer = null;
+
+        function log(msg, type = '') {
+            const span = document.createElement('span');
+            span.className = type;
+            span.textContent = msg + '\n';
+            terminalEl.appendChild(span);
+            terminalEl.scrollTop = terminalEl.scrollHeight;
+        }
+
+        function setStatus(msg, type = '') {
+            statusEl.innerHTML = `상태: <span class="${type}">${msg}</span>`;
+        }
+
+        async function init() {
+            try {
+                setStatus('WebContainer 부팅 중...', 'info');
+                log('WebContainer 초기화 시작...', 'info');
+
+                webcontainer = await WebContainer.boot();
+
+                setStatus('준비됨!', 'success');
+                log('✅ WebContainer 부팅 성공!', 'success');
+                log('');
+
+                // 기본 파일 시스템 테스트
+                log('파일 시스템 테스트...', 'info');
+                await webcontainer.fs.writeFile('/test.txt', 'Hello from WebContainer!');
+                const content = await webcontainer.fs.readFile('/test.txt', 'utf-8');
+                log(`파일 읽기: ${content}`, 'success');
+                log('');
+
+                // Node.js 버전 확인
+                log('Node.js 버전 확인...', 'info');
+                const nodeProcess = await webcontainer.spawn('node', ['--version']);
+                nodeProcess.output.pipeTo(new WritableStream({
+                    write(data) {
+                        log(`Node.js: ${data}`, 'success');
+                    }
+                }));
+                await nodeProcess.exit;
+
+                // npm 버전 확인
+                log('npm 버전 확인...', 'info');
+                const npmProcess = await webcontainer.spawn('npm', ['--version']);
+                npmProcess.output.pipeTo(new WritableStream({
+                    write(data) {
+                        log(`npm: ${data}`, 'success');
+                    }
+                }));
+                await npmProcess.exit;
+
+                log('');
+                log('🎉 모든 테스트 통과!', 'success');
+                log('Claude CLI 설치 가능!', 'success');
+
+                window.webcontainer = webcontainer;
+
+            } catch (error) {
+                setStatus('오류 발생', 'error');
+                log(`❌ 오류: ${error.message}`, 'error');
+                log('');
+                log('상세:', 'error');
+                log(error.stack || error.toString(), 'error');
+            }
+        }
+
+        window.runTest = async function() {
+            if (!webcontainer) {
+                log('WebContainer가 초기화되지 않았습니다', 'error');
+                return;
+            }
+
+            log('');
+            log('=== Claude CLI 설치 테스트 ===', 'info');
+            log('');
+
+            try {
+                // 1. package.json 생성
+                log('package.json 생성 중...', 'info');
+                await webcontainer.fs.writeFile('/package.json', JSON.stringify({
+                    name: "claude-workspace",
+                    type: "module",
+                    dependencies: {
+                        "@anthropic-ai/claude-code": "latest"
+                    }
+                }, null, 2));
+                log('✅ package.json 생성 완료', 'success');
+                log('');
+
+                // 2. npm install (로컬 설치)
+                log('npm install 실행 중... (시간이 걸립니다)', 'info');
+                const installProcess = await webcontainer.spawn('npm', ['install']);
+
+                installProcess.output.pipeTo(new WritableStream({
+                    write(data) {
+                        log(data);
+                    }
+                }));
+
+                const exitCode = await installProcess.exit;
+
+                if (exitCode === 0) {
+                    log('');
+                    log('✅ Claude CLI 설치 성공!', 'success');
+                    log('');
+
+                    // 3. Claude 버전 확인
+                    log('Claude 버전 확인 중...', 'info');
+                    const claudeProcess = await webcontainer.spawn('npx', ['claude', '--version']);
+                    claudeProcess.output.pipeTo(new WritableStream({
+                        write(data) {
+                            log(`Claude: ${data}`, 'success');
+                        }
+                    }));
+                    await claudeProcess.exit;
+                } else {
+                    log('');
+                    log(`❌ 설치 실패 (exit code: ${exitCode})`, 'error');
+                }
+            } catch (error) {
+                log(`❌ 오류: ${error.message}`, 'error');
+            }
+        };
+
+        // 페이지 로드 시 초기화
+        init();
+    </script>
+</body>
+</html>
