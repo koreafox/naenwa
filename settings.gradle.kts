@@ -17,3 +17,5 @@ dependencyResolutionManagement {
 
 rootProject.name = "NaenwaRemote"
 include(":app")
+include(":terminal-emulator")
+include(":terminal-view")

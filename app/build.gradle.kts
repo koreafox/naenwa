@@ -9,13 +9,37 @@ plugins {
 android {
     namespace = "com.naenwa.remote"
     compileSdk = 34
+    ndkVersion = "26.1.10909125"
 
     defaultConfig {
-        applicationId = "com.naenwa.remote"
+        applicationId = "com.termux"  // Use termux package name for bootstrap compatibility
         minSdk = 26
-        targetSdk = 34
+        targetSdk = 28  // Must be 28 to allow executing binaries from app data (W^X bypass)
         versionCode = 1
         versionName = "1.0"
+
+        ndk {
+            abiFilters += listOf("armeabi-v7a", "arm64-v8a", "x86_64")
+        }
+
+        externalNativeBuild {
+            cmake {
+                arguments += listOf("-DANDROID_STL=c++_shared")
+            }
+        }
+    }
+
+    externalNativeBuild {
+        cmake {
+            path = file("src/main/cpp/CMakeLists.txt")
+            version = "3.22.1"
+        }
+    }
+
+    sourceSets {
+        getByName("main") {
+            jniLibs.srcDirs("libnode/bin")
+        }
     }
 
     buildTypes {
@@ -40,9 +64,18 @@ android {
     buildFeatures {
         viewBinding = true
     }
+
+    packaging {
+        jniLibs {
+            useLegacyPackaging = true
+        }
+    }
 }
 
 dependencies {
+    // Terminal Emulator
+    implementation(project(":terminal-view"))
+
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
     implementation("com.google.android.material:material:1.11.0")
@@ -96,4 +129,7 @@ dependencies {
 
     // Local HTTP Server
     implementation("org.nanohttpd:nanohttpd:2.3.1")
+
+    // MediaPipe LLM Inference (Gemma 3n)
+    implementation("com.google.mediapipe:tasks-genai:0.10.22")
 }
