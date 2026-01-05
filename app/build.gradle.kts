@@ -132,4 +132,7 @@ dependencies {
 
     // MediaPipe LLM Inference (Gemma 3n)
     implementation("com.google.mediapipe:tasks-genai:0.10.22")
+
+    // Apache Commons Compress (for tar.gz extraction)
+    implementation("org.apache.commons:commons-compress:1.26.0")
 }

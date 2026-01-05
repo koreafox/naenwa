@@ -53,4 +53,8 @@
     <color name="claude_avatar_icon">#FFFFFF</color>
     <color name="user_bubble">#2196F3</color>
     <color name="claude_bubble">#2D2D2D</color>
+
+    <!-- Mode Selector -->
+    <color name="mode_selected_bg">#1E3A5F</color>
+    <color name="mode_selector_bg">#1A1A1A</color>
 </resources>

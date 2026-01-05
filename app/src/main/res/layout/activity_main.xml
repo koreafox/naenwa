@@ -64,14 +64,55 @@
                             android:textSize="12sp"
                             android:textColor="@color/text_secondary" />
 
-                        <!-- 원격 모드 아이콘 -->
-                        <ImageView
-                            android:id="@+id/iconRemote"
-                            android:layout_width="20dp"
-                            android:layout_height="20dp"
+                        <!-- 모드 선택 버튼들 -->
+                        <LinearLayout
+                            android:layout_width="wrap_content"
+                            android:layout_height="wrap_content"
                             android:layout_marginStart="8dp"
-                            android:src="@drawable/ic_desktop_cloud"
-                            android:contentDescription="Remote Mode" />
+                            android:orientation="horizontal"
+                            android:gravity="center_vertical"
+                            android:background="@drawable/mode_selector_background"
+                            android:padding="2dp">
+
+                            <!-- 원격 모드 버튼 -->
+                            <com.google.android.material.button.MaterialButton
+                                android:id="@+id/btnRemoteMode"
+                                style="@style/Widget.Material3.Button.IconButton"
+                                android:layout_width="28dp"
+                                android:layout_height="28dp"
+                                app:icon="@drawable/ic_desktop_cloud"
+                                app:iconSize="16dp"
+                                app:iconTint="@color/primary"
+                                android:backgroundTint="@color/mode_selected_bg"
+                                app:cornerRadius="6dp" />
+
+                            <!-- 로컬 모드 버튼 -->
+                            <com.google.android.material.button.MaterialButton
+                                android:id="@+id/btnLocalMode"
+                                style="@style/Widget.Material3.Button.IconButton"
+                                android:layout_width="28dp"
+                                android:layout_height="28dp"
+                                android:layout_marginStart="2dp"
+                                app:icon="@drawable/ic_phone"
+                                app:iconSize="16dp"
+                                app:iconTint="@color/text_hint"
+                                android:backgroundTint="@android:color/transparent"
+                                app:cornerRadius="6dp" />
+
+                            <!-- 터미널 모드 버튼 -->
+                            <com.google.android.material.button.MaterialButton
+                                android:id="@+id/btnTerminalMode"
+                                style="@style/Widget.Material3.Button.IconButton"
+                                android:layout_width="28dp"
+                                android:layout_height="28dp"
+                                android:layout_marginStart="2dp"
+                                app:icon="@drawable/ic_terminal"
+                                app:iconSize="16dp"
+                                app:iconTint="@color/text_hint"
+                                android:backgroundTint="@android:color/transparent"
+                                app:cornerRadius="6dp" />
+
+                        </LinearLayout>
 
                         <View
                             android:layout_width="0dp"

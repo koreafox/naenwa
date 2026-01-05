@@ -2,14 +2,19 @@ package com.naenwa.remote.terminal
 
 import android.content.Context
 import android.os.Build
+import android.os.Environment
+import android.util.Log
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import java.io.*
 import java.net.URL
+import java.util.zip.GZIPInputStream
 import java.util.zip.ZipInputStream
+import org.apache.commons.compress.archivers.tar.TarArchiveInputStream
 
 object TerminalInstaller {
 
+    private const val TAG = "TerminalInstaller"
     private const val BOOTSTRAP_VERSION = "bootstrap-2022.04.28-r5+apt-android-7"
 
     private val BOOTSTRAP_URL: String
@@ -24,9 +29,69 @@ object TerminalInstaller {
             return "https://github.com/termux/termux-packages/releases/download/$BOOTSTRAP_VERSION/bootstrap-$arch.zip"
         }
 
-    private fun getPrefixPath(context: Context) = "${context.filesDir.absolutePath}/usr"
-    private fun getHomePath(context: Context) = "${context.filesDir.absolutePath}/home"
+    // Ubuntu rootfs URL (official Ubuntu base)
+    private val UBUNTU_ROOTFS_URL: String
+        get() {
+            val arch = when {
+                Build.SUPPORTED_ABIS.contains("arm64-v8a") -> "arm64"
+                Build.SUPPORTED_ABIS.contains("x86_64") -> "amd64"
+                else -> "arm64"
+            }
+            return "https://cdimage.ubuntu.com/ubuntu-base/releases/22.04/release/ubuntu-base-22.04-base-$arch.tar.gz"
+        }
+
+    // Use hardcoded Termux paths (bootstrap expects these exact paths)
+    private fun getPrefixPath(context: Context) = "/data/data/com.termux/files/usr"
+    private fun getHomePath(context: Context) = "/data/data/com.termux/files/home"
     private fun getStagingPath(context: Context) = "${context.filesDir.absolutePath}/staging"
+
+    // External storage paths for persistent Ubuntu environment
+    // Use /sdcard/naenwa/ for persistence (survives app uninstall)
+    private var cachedExternalDir: File? = null
+
+    /**
+     * Get external naenwa directory for user data (survives app uninstall)
+     * Used for: home folder, user configurations
+     */
+    private fun getExternalNaenwaDir(context: Context): File {
+        if (cachedExternalDir != null) return cachedExternalDir!!
+
+        // Primary: shared external storage /sdcard/naenwa/ (survives app uninstall)
+        val sharedDir = File(Environment.getExternalStorageDirectory(), "naenwa")
+        if (sharedDir.mkdirs() || sharedDir.exists()) {
+            Log.i(TAG, "Using shared external dir for user data: ${sharedDir.absolutePath}")
+            cachedExternalDir = sharedDir
+            return sharedDir
+        }
+
+        // Fallback: app's external files directory
+        val appExternalDir = context.getExternalFilesDir(null)
+        if (appExternalDir != null) {
+            val naenwaDir = File(appExternalDir, "naenwa")
+            if (naenwaDir.mkdirs() || naenwaDir.exists()) {
+                Log.i(TAG, "Using app external dir: ${naenwaDir.absolutePath}")
+                cachedExternalDir = naenwaDir
+                return naenwaDir
+            }
+        }
+
+        // Last resort: app's internal files directory
+        val internalDir = File(context.filesDir, "naenwa")
+        internalDir.mkdirs()
+        Log.i(TAG, "Using internal dir: ${internalDir.absolutePath}")
+        cachedExternalDir = internalDir
+        return internalDir
+    }
+
+    /**
+     * Get Ubuntu rootfs path - MUST be in internal storage for execute permission
+     * Android external storage (sdcard) doesn't support execute permission
+     */
+    private fun getUbuntuRootfsPath(context: Context): File {
+        val internalDir = File(context.filesDir, "ubuntu-rootfs")
+        internalDir.mkdirs()
+        return internalDir
+    }
 
     suspend fun install(
         context: Context,
@@ -37,60 +102,288 @@ object TerminalInstaller {
             val homePath = getHomePath(context)
             val stagingPath = getStagingPath(context)
 
-            // Clean up
-            File(prefixPath).deleteRecursively()
-            File(stagingPath).deleteRecursively()
-            File(stagingPath).mkdirs()
-            File(homePath).mkdirs()
+            // Check if bootstrap already exists
+            val bootstrapExists = File(prefixPath, "bin/bash").exists()
 
-            onProgress(5, "Downloading bootstrap...")
+            if (bootstrapExists) {
+                Log.i(TAG, "Bootstrap already exists, skipping bootstrap installation")
+                onProgress(40, "Bootstrap already installed...")
+            } else {
+                // Clean up and install bootstrap
+                File(prefixPath).deleteRecursively()
+                File(stagingPath).deleteRecursively()
+                File(stagingPath).mkdirs()
+                File(homePath).mkdirs()
 
-            // Download bootstrap
-            val bootstrapZip = File(stagingPath, "bootstrap.zip")
-            downloadFile(BOOTSTRAP_URL, bootstrapZip) { progress ->
-                onProgress(5 + (progress * 0.4).toInt(), "Downloading bootstrap... $progress%")
+                onProgress(3, "Downloading Termux bootstrap...")
+
+                // Download bootstrap
+                val bootstrapZip = File(stagingPath, "bootstrap.zip")
+                downloadFile(BOOTSTRAP_URL, bootstrapZip) { progress ->
+                    onProgress(3 + (progress * 0.25).toInt(), "Downloading bootstrap... $progress%")
+                }
+
+                onProgress(28, "Extracting bootstrap...")
+
+                // Extract bootstrap
+                extractBootstrap(bootstrapZip, prefixPath) { progress ->
+                    onProgress(28 + (progress * 0.2).toInt(), "Extracting... $progress%")
+                }
+
+                // Cleanup bootstrap zip
+                File(stagingPath).deleteRecursively()
             }
 
-            onProgress(45, "Extracting bootstrap...")
-
-            // Extract bootstrap
-            extractBootstrap(bootstrapZip, prefixPath) { progress ->
-                onProgress(45 + (progress * 0.4).toInt(), "Extracting... $progress%")
-            }
-
-            onProgress(80, "Setting up symlinks...")
-
-            // Setup symlinks
+            // Always setup symlinks (needed even if bootstrap already exists)
+            onProgress(48, "Setting up symlinks...")
             setupSymlinks(prefixPath)
 
-            onProgress(85, "Installing proot-distro...")
-
-            // Install proot and proot-distro
-            installProotDistro(prefixPath)
-
-            onProgress(92, "Copying setup script...")
-
-            // Copy naenwa-setup.sh from assets
-            copySetupScript(context, homePath)
-
-            onProgress(92, "Fixing paths...")
+            onProgress(50, "Fixing paths...")
 
             // Fix hardcoded termux paths in profile files
             fixTermuxPaths(prefixPath)
 
-            onProgress(95, "Finalizing...")
-
-            // Set permissions
+            // Set permissions first (needed for pkg/npm to work)
             setPermissions(prefixPath)
 
-            // Cleanup
-            File(stagingPath).deleteRecursively()
+            onProgress(55, "Installing Node.js...")
+
+            // Install Node.js and Claude CLI
+            installNodeAndClaude(prefixPath, homePath, onProgress)
+
+            onProgress(95, "Creating config files...")
+
+            // Create bashrc with welcome message
+            createBashConfig(homePath)
+
+            // Copy startup scripts
+            copySetupScript(context, homePath)
 
             onProgress(100, "Installation complete!")
             true
         } catch (e: Exception) {
+            Log.e(TAG, "Installation failed", e)
             e.printStackTrace()
             false
+        }
+    }
+
+    /**
+     * Install Node.js and Claude Code CLI during bootstrap installation
+     */
+    private fun installNodeAndClaude(prefixPath: String, homePath: String, onProgress: (Int, String) -> Unit) {
+        val binPath = "$prefixPath/bin"
+        val envVars = arrayOf(
+            "PATH=$binPath:/system/bin:/system/xbin",
+            "HOME=$homePath",
+            "PREFIX=$prefixPath",
+            "LD_LIBRARY_PATH=$prefixPath/lib",
+            "TMPDIR=$prefixPath/tmp",
+            "TERM=xterm-256color",
+            "LANG=en_US.UTF-8",
+            "ANDROID_DATA=/data",
+            "ANDROID_ROOT=/system"
+        )
+
+        try {
+            // Step 1: pkg update (with auto-accept for config files)
+            onProgress(58, "Updating package list...")
+            runShellCommand("$binPath/bash", arrayOf("-c",
+                "yes | pkg update -y -o Dpkg::Options::=--force-confnew"), homePath, envVars)
+
+            // Step 2: Install Node.js
+            onProgress(65, "Installing Node.js (this may take a while)...")
+            runShellCommand("$binPath/bash", arrayOf("-c",
+                "yes | pkg install -y -o Dpkg::Options::=--force-confnew nodejs-lts"), homePath, envVars)
+
+            // Step 3: Install Claude Code CLI
+            onProgress(80, "Installing Claude Code CLI...")
+            runShellCommand("$binPath/bash", arrayOf("-c", "npm install -g @anthropic-ai/claude-code"), homePath, envVars)
+
+            // Step 4: Fix Claude CLI shebang issue
+            // The npm package uses #!/usr/bin/env node, but Termux doesn't have /usr/bin/env
+            // Create a wrapper script that calls node directly
+            onProgress(90, "Configuring Claude CLI...")
+            fixClaudeShebang(prefixPath)
+
+            Log.i(TAG, "Node.js and Claude Code CLI installed successfully")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to install Node.js/Claude: ${e.message}", e)
+            // Don't throw - we'll create a setup script as fallback
+            createFallbackSetupScript(homePath)
+        }
+    }
+
+    private fun runShellCommand(shell: String, args: Array<String>, workDir: String, envVars: Array<String>) {
+        val processBuilder = ProcessBuilder(shell, *args)
+            .directory(File(workDir))
+            .redirectErrorStream(true)
+
+        processBuilder.environment().clear()
+        envVars.forEach { env ->
+            val parts = env.split("=", limit = 2)
+            if (parts.size == 2) {
+                processBuilder.environment()[parts[0]] = parts[1]
+            }
+        }
+
+        val process = processBuilder.start()
+
+        // Read output for logging
+        val reader = BufferedReader(InputStreamReader(process.inputStream))
+        var line: String?
+        while (reader.readLine().also { line = it } != null) {
+            Log.d(TAG, "Shell: $line")
+        }
+
+        val exitCode = process.waitFor()
+        if (exitCode != 0) {
+            Log.w(TAG, "Shell command exited with code: $exitCode")
+        }
+    }
+
+    private fun createFallbackSetupScript(homePath: String) {
+        val setupScript = File(homePath, "setup-claude.sh")
+        setupScript.writeText("""
+#!/data/data/com.termux/files/usr/bin/bash
+set -e
+echo "Installing Node.js..."
+pkg update -y && pkg install -y nodejs-lts
+echo "Installing Claude Code CLI..."
+npm install -g @anthropic-ai/claude-code
+echo "Done! Type 'claude' to start."
+""".trimIndent())
+        setupScript.setExecutable(true, false)
+        Log.i(TAG, "Created fallback setup script")
+    }
+
+    /**
+     * Fix Claude CLI shebang issue
+     * The npm package uses #!/usr/bin/env node, but Termux doesn't have /usr/bin/env
+     * Create a wrapper script that calls node directly
+     */
+    private fun fixClaudeShebang(prefixPath: String) {
+        val binPath = "$prefixPath/bin"
+        val claudeSymlink = File(binPath, "claude")
+        val claudeCliPath = "$prefixPath/lib/node_modules/@anthropic-ai/claude-code/cli.js"
+        val nodePath = "$binPath/node"
+
+        try {
+            // Remove the npm-created symlink
+            if (claudeSymlink.exists()) {
+                claudeSymlink.delete()
+            }
+
+            // Create a wrapper script that calls node directly
+            claudeSymlink.writeText("""
+#!/data/data/com.termux/files/usr/bin/bash
+exec "$nodePath" "$claudeCliPath" "$@"
+""".trimIndent())
+            claudeSymlink.setExecutable(true, false)
+            claudeSymlink.setReadable(true, false)
+
+            Log.i(TAG, "Fixed Claude CLI shebang with wrapper script")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to fix Claude CLI shebang: ${e.message}", e)
+        }
+    }
+
+    /**
+     * Create .bashrc that auto-starts Claude
+     */
+    private fun createBashConfig(homePath: String) {
+        val bashrcFile = File(homePath, ".bashrc")
+        bashrcFile.writeText("""
+# Naenwa Terminal Configuration
+# Auto-start Claude on terminal open
+if command -v claude &> /dev/null; then
+    claude
+fi
+""".trimIndent())
+        bashrcFile.setReadable(true, false)
+
+        val bashProfileFile = File(homePath, ".bash_profile")
+        bashProfileFile.writeText("""
+# Source .bashrc for interactive login shells
+if [ -f ~/.bashrc ]; then
+    source ~/.bashrc
+fi
+""".trimIndent())
+        bashProfileFile.setReadable(true, false)
+
+        Log.i(TAG, "Created bash config at $homePath")
+    }
+
+    /**
+     * Extract proot binary from .deb package
+     */
+    private fun extractProotFromDeb(debFile: File, prootDest: File, binDir: File) {
+        Log.i(TAG, "Extracting proot from deb package...")
+
+        // .deb is an ar archive containing data.tar.xz
+        org.apache.commons.compress.archivers.ar.ArArchiveInputStream(
+            FileInputStream(debFile)
+        ).use { arInput ->
+            var arEntry = arInput.nextArEntry
+            while (arEntry != null) {
+                if (arEntry.name.startsWith("data.tar")) {
+                    Log.i(TAG, "Found ${arEntry.name} in deb")
+
+                    // Determine compression type
+                    val tarInput = when {
+                        arEntry.name.endsWith(".xz") -> {
+                            TarArchiveInputStream(
+                                org.apache.commons.compress.compressors.xz.XZCompressorInputStream(arInput)
+                            )
+                        }
+                        arEntry.name.endsWith(".gz") -> {
+                            TarArchiveInputStream(GZIPInputStream(arInput))
+                        }
+                        arEntry.name.endsWith(".zst") -> {
+                            TarArchiveInputStream(
+                                org.apache.commons.compress.compressors.zstandard.ZstdCompressorInputStream(arInput)
+                            )
+                        }
+                        else -> {
+                            TarArchiveInputStream(arInput)
+                        }
+                    }
+
+                    // Extract proot binary and libraries
+                    var tarEntry = tarInput.nextTarEntry
+                    while (tarEntry != null) {
+                        val name = tarEntry.name
+                        when {
+                            name.endsWith("/bin/proot") || name.endsWith("/proot") -> {
+                                Log.i(TAG, "Found proot: $name")
+                                FileOutputStream(prootDest).use { fos ->
+                                    tarInput.copyTo(fos)
+                                }
+                                prootDest.setExecutable(true, false)
+                            }
+                            name.contains("/lib/") && name.endsWith(".so") -> {
+                                // Also extract required libraries
+                                val libName = name.substringAfterLast("/")
+                                val libDest = File(binDir.parentFile, "lib/$libName")
+                                libDest.parentFile?.mkdirs()
+                                FileOutputStream(libDest).use { fos ->
+                                    tarInput.copyTo(fos)
+                                }
+                                Log.i(TAG, "Extracted lib: $libName")
+                            }
+                        }
+                        tarEntry = tarInput.nextTarEntry
+                    }
+                    break
+                }
+                arEntry = arInput.nextArEntry
+            }
+        }
+
+        if (prootDest.exists()) {
+            Log.i(TAG, "proot extracted successfully: ${prootDest.length()} bytes")
+        } else {
+            Log.e(TAG, "Failed to extract proot from deb")
         }
     }
 
@@ -198,6 +491,8 @@ object TerminalInstaller {
     private fun setupSymlinks(prefixPath: String) {
         val binDir = File(prefixPath, "bin")
         val libDir = File(prefixPath, "lib")
+        val etcDir = File(prefixPath, "etc")
+        val aptDir = File(prefixPath, "lib/apt/methods")
 
         // 1. Create sh -> bash symlink
         val shFile = File(binDir, "sh")
@@ -246,42 +541,53 @@ object TerminalInstaller {
             }
         }
 
-        // 4. Create library symlinks for ALL versioned formats
-        // Handles: libz.so.1.2.12 -> libz.so.1 -> libz.so
-        libDir.listFiles()?.filter { it.isFile }?.forEach { file ->
-            val name = file.name
-            if (name.contains(".so.")) {
-                // Pattern: libX.so.1.2.3 or libX.so.1.2 or libX.so.1
-                val regex = Regex("(.+\\.so)\\.([0-9]+)(\\..*)?")
+        // 4. FIX LIBRARY SYMLINKS - Delete broken symlinks first, then create correct ones
+        // First, find all actual .so files (not symlinks)
+        val actualLibs = mutableMapOf<String, String>()  // baseName -> actualFileName
+        libDir.listFiles()?.forEach { file ->
+            // Check if it's a real file (not a symlink)
+            if (file.isFile && !isSymlink(file)) {
+                val name = file.name
+                // Match patterns like libz.so.1.2.12, libbz2.so.1.0.8, etc.
+                val regex = Regex("(.+\\.so)\\.([0-9]+)\\.([0-9]+)\\.?([0-9]*)")
                 val match = regex.matchEntire(name)
                 if (match != null) {
-                    val baseSo = match.groupValues[1]  // libX.so
+                    val baseSo = match.groupValues[1]  // libz.so
                     val majorVersion = match.groupValues[2]  // 1
+                    val minorVersion = match.groupValues[3]  // 2 or 0
+                    val soMajor = "$baseSo.$majorVersion"  // libz.so.1
+                    val soMajorMinor = "$baseSo.$majorVersion.$minorVersion"  // libz.so.1.2
 
-                    // Create libX.so.1 symlink
-                    val soMajor = "$baseSo.$majorVersion"
-                    if (soMajor != name) {
-                        val soMajorFile = File(libDir, soMajor)
-                        if (!soMajorFile.exists()) {
-                            try {
-                                android.system.Os.symlink(name, soMajorFile.absolutePath)
-                                android.util.Log.i("TerminalInstaller", "Created lib symlink: $soMajor -> $name")
-                            } catch (e: Exception) {
-                                file.copyTo(soMajorFile, overwrite = true)
-                            }
-                        }
-                    }
+                    // Store ALL mappings including major.minor (needed for libbz2.so.1.0)
+                    actualLibs[soMajorMinor] = name  // libz.so.1.2 -> libz.so.1.2.12
+                    actualLibs[soMajor] = name       // libz.so.1 -> libz.so.1.2.12
+                    actualLibs[baseSo] = name        // libz.so -> libz.so.1.2.12
+                }
+            }
+        }
 
-                    // Create libX.so symlink
-                    val soFile = File(libDir, baseSo)
-                    if (!soFile.exists()) {
-                        try {
-                            android.system.Os.symlink(name, soFile.absolutePath)
-                            android.util.Log.i("TerminalInstaller", "Created lib symlink: $baseSo -> $name")
-                        } catch (e: Exception) {
-                            file.copyTo(soFile, overwrite = true)
-                        }
-                    }
+        // Now create/fix symlinks
+        actualLibs.forEach { (linkName, targetName) ->
+            // Skip if linkName == targetName (would delete the original file!)
+            if (linkName == targetName) return@forEach
+
+            val linkFile = File(libDir, linkName)
+            try {
+                // Delete existing (possibly broken) symlink, but NOT if it's the actual file
+                if (isSymlink(linkFile)) {
+                    linkFile.delete()
+                } else if (linkFile.exists()) {
+                    // It's a real file, don't delete
+                    return@forEach
+                }
+                android.system.Os.symlink(targetName, linkFile.absolutePath)
+                android.util.Log.i("TerminalInstaller", "Fixed lib symlink: $linkName -> $targetName")
+            } catch (e: Exception) {
+                // Fallback: copy the file
+                try {
+                    File(libDir, targetName).copyTo(linkFile, overwrite = true)
+                } catch (e2: Exception) {
+                    android.util.Log.e("TerminalInstaller", "Failed to create symlink $linkName: ${e.message}")
                 }
             }
         }
@@ -296,9 +602,47 @@ object TerminalInstaller {
                 // Ignore
             }
         }
+
+        // 6. FIX APT HTTPS - Copy http method as https (SSL libs not available in bootstrap)
+        val httpMethod = File(aptDir, "http")
+        val httpsMethod = File(aptDir, "https")
+        if (httpMethod.exists() && !httpsMethod.exists()) {
+            try {
+                httpMethod.copyTo(httpsMethod, overwrite = true)
+                httpsMethod.setExecutable(true, false)
+                android.util.Log.i("TerminalInstaller", "Created https method from http")
+            } catch (e: Exception) {
+                android.util.Log.e("TerminalInstaller", "Failed to create https method: ${e.message}")
+            }
+        }
+
+        // 7. FIX APT SOURCES - Change https to http in sources.list
+        val sourcesListFile = File(etcDir, "apt/sources.list")
+        if (sourcesListFile.exists()) {
+            try {
+                var content = sourcesListFile.readText()
+                if (content.contains("https://")) {
+                    content = content.replace("https://", "http://")
+                    sourcesListFile.writeText(content)
+                    android.util.Log.i("TerminalInstaller", "Fixed sources.list to use http")
+                }
+            } catch (e: Exception) {
+                android.util.Log.e("TerminalInstaller", "Failed to fix sources.list: ${e.message}")
+            }
+        }
     }
 
-    private fun installProotDistro(prefixPath: String) {
+    private fun isSymlink(file: File): Boolean {
+        return try {
+            val canonicalPath = file.canonicalPath
+            val absolutePath = file.absolutePath
+            canonicalPath != absolutePath
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    private fun installProotDistro(context: Context, prefixPath: String) {
         val binDir = File(prefixPath, "bin")
         val etcDir = File(prefixPath, "etc/proot-distro")
         etcDir.mkdirs()
@@ -311,17 +655,36 @@ object TerminalInstaller {
             else -> "aarch64"
         }
 
-        // Download proot binary from Termux packages
+        // Copy proot binary from assets (bundled with APK)
         val prootFile = File(binDir, "proot")
         if (!prootFile.exists()) {
             try {
-                // Use proot from termux-packages release (static build)
-                val prootUrl = "https://github.com/proot-me/proot/releases/download/v5.4.0/proot-v5.4.0-$arch-static"
-                downloadFile(prootUrl, prootFile) { }
+                // proot is bundled as asset for reliability
+                val assetName = "proot-$arch"
+                Log.i(TAG, "Copying proot from assets: $assetName")
+
+                context.assets.open(assetName).use { input ->
+                    FileOutputStream(prootFile).use { output ->
+                        input.copyTo(output)
+                    }
+                }
                 prootFile.setExecutable(true, false)
-                android.util.Log.i("TerminalInstaller", "Downloaded proot binary")
+                prootFile.setReadable(true, false)
+                Log.i(TAG, "Installed proot from assets: ${prootFile.length()} bytes")
             } catch (e: Exception) {
-                android.util.Log.e("TerminalInstaller", "Failed to download proot: ${e.message}")
+                Log.e(TAG, "Failed to install proot from assets: ${e.message}", e)
+
+                // Fallback: try to download from Termux packages
+                try {
+                    val prootDebUrl = "https://packages.termux.dev/apt/termux-main/pool/main/p/proot/proot_5.1.107-68_$arch.deb"
+                    val prootDeb = File(binDir.parentFile, "proot.deb")
+                    Log.i(TAG, "Fallback: downloading proot from $prootDebUrl")
+                    downloadFile(prootDebUrl, prootDeb) { }
+                    extractProotFromDeb(prootDeb, prootFile, binDir)
+                    prootDeb.delete()
+                } catch (e2: Exception) {
+                    Log.e(TAG, "Failed to download proot fallback: ${e2.message}")
+                }
             }
         }
 
@@ -455,6 +818,15 @@ object TerminalInstaller {
         // Set executable on libexec files
         val libexecDir = File(prefixPath, "libexec")
         libexecDir.listFiles()?.forEach { file ->
+            if (file.isFile) {
+                file.setExecutable(true, false)
+                file.setReadable(true, false)
+            }
+        }
+
+        // Set executable on apt methods (CRITICAL for pkg to work)
+        val aptMethodsDir = File(prefixPath, "lib/apt/methods")
+        aptMethodsDir.listFiles()?.forEach { file ->
             if (file.isFile) {
                 file.setExecutable(true, false)
                 file.setReadable(true, false)

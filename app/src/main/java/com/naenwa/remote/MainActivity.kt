@@ -28,7 +28,10 @@ import com.naenwa.remote.adapter.ChatDisplayMessage
 import com.naenwa.remote.adapter.ChatMessageAdapter
 import com.naenwa.remote.adapter.SessionAdapter
 import com.naenwa.remote.auth.AuthManager
+import com.naenwa.remote.auth.ClaudeOAuth
 import com.naenwa.remote.auth.GitHubAuthManager
+import com.naenwa.remote.nodejs.ClaudeBridge
+import com.naenwa.remote.nodejs.StreamEvent
 import com.naenwa.remote.data.AppDatabase
 import com.naenwa.remote.data.ChatMessage
 import com.naenwa.remote.data.ChatSession
@@ -38,6 +41,9 @@ import com.naenwa.remote.network.ApkInstaller
 import com.naenwa.remote.network.WebSocketClient
 import com.naenwa.remote.service.FloatingService
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
@@ -76,6 +82,11 @@ class MainActivity : AppCompatActivity() {
 
     // FloatingService 없이 직접 연결한 경우의 클라이언트
     private var directWebSocketClient: WebSocketClient? = null
+
+    // Claude Bridge (nodejs-mobile 기반)
+    private val claudeBridge by lazy { ClaudeBridge.getInstance(this) }
+    private val claudeOAuth by lazy { ClaudeOAuth(this) }
+    private var useCLIMode = false  // CLI 모드 사용 여부
 
     // Google Sign-In launcher
     private val signInLauncher = registerForActivityResult(
@@ -147,6 +158,31 @@ class MainActivity : AppCompatActivity() {
     ) { granted ->
         if (!granted) {
             Toast.makeText(this, "알림 표시를 위해 알림 권한이 필요합니다", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // 저장소 권한 launcher
+    private val storagePermissionLauncher = registerForActivityResult(
+        ActivityResultContracts.RequestMultiplePermissions()
+    ) { permissions ->
+        val allGranted = permissions.values.all { it }
+        if (allGranted) {
+            Log.i(TAG, "Storage permission granted")
+        } else {
+            Toast.makeText(this, "터미널 모드를 위해 저장소 권한이 필요합니다", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    // Android 11+ 모든 파일 접근 권한 launcher
+    private val manageStorageLauncher = registerForActivityResult(
+        ActivityResultContracts.StartActivityForResult()
+    ) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            if (android.os.Environment.isExternalStorageManager()) {
+                Log.i(TAG, "All files access granted")
+            } else {
+                Toast.makeText(this, "파일 접근 권한이 필요합니다", Toast.LENGTH_SHORT).show()
+            }
         }
     }
 
@@ -378,9 +414,13 @@ class MainActivity : AppCompatActivity() {
                     // DB에 저장
                     saveMessageInternal(text, MessageType.USER_INPUT)
 
-                    // 서버로 전송
-                    val client = FloatingService.webSocketClient ?: directWebSocketClient
-                    client?.sendText(text)
+                    // CLI 모드 또는 서버 모드로 전송
+                    if (useCLIMode) {
+                        sendToCLI(text)
+                    } else {
+                        val client = FloatingService.webSocketClient ?: directWebSocketClient
+                        client?.sendText(text)
+                    }
                 }
             }
         }
@@ -802,6 +842,47 @@ class MainActivity : AppCompatActivity() {
             binding.drawerLayout.openDrawer(GravityCompat.START)
         }
 
+        // 모드 선택 버튼
+        binding.btnRemoteMode.setOnClickListener {
+            // 원격 모드로 전환
+            useCLIMode = false
+            updateModeButtons(isRemote = true)
+            appendLog("[모드] 원격 서버 모드")
+        }
+
+        binding.btnLocalMode.setOnClickListener {
+            // 로컬 CLI 모드로 전환
+            useCLIMode = true
+            updateModeButtons(isRemote = false)
+            appendLog("[모드] 로컬 CLI 모드")
+            initializeClaudeBridge()
+        }
+
+        // 길게 누르면 Claude 로그인
+        binding.btnLocalMode.setOnLongClickListener {
+            if (claudeOAuth.isLoggedIn()) {
+                // 이미 로그인됨 - 로그아웃 확인
+                android.app.AlertDialog.Builder(this)
+                    .setTitle("Claude 로그아웃")
+                    .setMessage("Claude에서 로그아웃 하시겠습니까?")
+                    .setPositiveButton("로그아웃") { _, _ ->
+                        claudeOAuth.logout()
+                        appendLog("[CLI] 로그아웃 완료", type = MessageType.SYSTEM)
+                    }
+                    .setNegativeButton("취소", null)
+                    .show()
+            } else {
+                // 로그인 시작
+                startClaudeLogin()
+            }
+            true
+        }
+
+        binding.btnTerminalMode.setOnClickListener {
+            // 터미널 모드로 전환 - TerminalActivity 시작
+            startActivity(Intent(this, com.naenwa.remote.terminal.TerminalActivity::class.java))
+        }
+
         // 상태 텍스트 클릭 - 로그인/연결/해제 토글
         val connectionClickListener = android.view.View.OnClickListener {
             if (!authManager.isLoggedIn) {
@@ -853,8 +934,38 @@ class MainActivity : AppCompatActivity() {
     private fun showLoading(show: Boolean) {
         runOnUiThread {
             binding.progressLoading.visibility = if (show) android.view.View.VISIBLE else android.view.View.GONE
-            val hasConnection = FloatingService.webSocketClient != null || directWebSocketClient != null
-            binding.btnSend.isEnabled = !show && hasConnection
+            if (useCLIMode) {
+                // CLI 모드에서는 로딩 중이 아닐 때 항상 활성화
+                binding.btnSend.isEnabled = !show
+            } else {
+                // 원격 모드에서는 연결 상태도 확인
+                val hasConnection = FloatingService.webSocketClient != null || directWebSocketClient != null
+                binding.btnSend.isEnabled = !show && hasConnection
+            }
+        }
+    }
+
+    private fun updateModeButtons(isRemote: Boolean) {
+        runOnUiThread {
+            if (isRemote) {
+                binding.btnRemoteMode.setIconTintResource(R.color.primary)
+                binding.btnRemoteMode.setBackgroundColor(ContextCompat.getColor(this, R.color.mode_selected_bg))
+                binding.btnLocalMode.setIconTintResource(R.color.text_hint)
+                binding.btnLocalMode.setBackgroundColor(android.graphics.Color.TRANSPARENT)
+
+                // 원격 모드: 서버 연결 상태에 따라 Send 버튼 활성화
+                val hasConnection = FloatingService.webSocketClient != null || directWebSocketClient != null
+                binding.btnSend.isEnabled = hasConnection
+            } else {
+                binding.btnRemoteMode.setIconTintResource(R.color.text_hint)
+                binding.btnRemoteMode.setBackgroundColor(android.graphics.Color.TRANSPARENT)
+                binding.btnLocalMode.setIconTintResource(R.color.primary)
+                binding.btnLocalMode.setBackgroundColor(ContextCompat.getColor(this, R.color.mode_selected_bg))
+
+                // CLI 모드: Send 버튼 항상 활성화
+                binding.btnSend.isEnabled = true
+                binding.tvStatus.text = "CLI 모드"
+            }
         }
     }
 
@@ -1001,6 +1112,168 @@ class MainActivity : AppCompatActivity() {
             is WebSocketClient.ServerMessage.ProjectPath -> {
                 appendLog("[프로젝트] 서버 경로: ${message.path}")
             }
+
+            // 메시지 큐 관련
+            is WebSocketClient.ServerMessage.Queued -> {
+                // 메시지가 대기열에 추가됨
+                Toast.makeText(this, "📋 ${message.message}", Toast.LENGTH_SHORT).show()
+                appendLog("[대기열] ${message.message}: ${message.textPreview}", type = MessageType.SYSTEM)
+            }
+            is WebSocketClient.ServerMessage.Processing -> {
+                // 메시지 처리 시작
+                if (message.queueRemaining > 0) {
+                    appendLog("[처리 중] 남은 대기: ${message.queueRemaining}개", type = MessageType.SYSTEM)
+                }
+            }
+            is WebSocketClient.ServerMessage.QueueStatus -> {
+                // 대기열 상태 업데이트
+                if (message.remaining > 0) {
+                    appendLog("[대기열] ${message.message}", type = MessageType.SYSTEM)
+                }
+            }
+        }
+    }
+
+    // ===== Claude Bridge 통합 (nodejs-mobile 기반) =====
+    private var bridgeInitialized = false
+
+    private fun initializeClaudeBridge() {
+        lifecycleScope.launch {
+            appendLog("[CLI] 초기화 중...")
+            val success = claudeBridge.initialize()
+            bridgeInitialized = success
+            if (success) {
+                // OAuth 토큰이 있으면 설정
+                val oauthToken = claudeOAuth.getAccessToken()
+                if (oauthToken != null) {
+                    val tokenSet = claudeBridge.setApiKey(oauthToken)
+                    if (tokenSet) {
+                        appendLog("[CLI] Claude 로그인 완료")
+                    }
+                } else {
+                    appendLog("[CLI] Claude 로그인 필요 (버튼 길게 누르기)", type = MessageType.SYSTEM)
+                }
+                appendLog("[CLI] 준비 완료")
+                updateCLIModeUI(ready = true)
+            } else {
+                appendLog("[CLI] 초기화 실패", type = MessageType.SYSTEM)
+                updateCLIModeUI(ready = false)
+            }
+        }
+    }
+
+    private var waitingForOAuthCode = false
+
+    /**
+     * Claude OAuth 로그인 시작
+     */
+    private fun startClaudeLogin() {
+        appendLog("[CLI] Claude 로그인 페이지로 이동...", type = MessageType.SYSTEM)
+        appendLog("[CLI] 로그인 후 표시된 코드를 복사하세요!", type = MessageType.SYSTEM)
+        waitingForOAuthCode = true
+        val intent = claudeOAuth.startLogin()
+        startActivity(intent)
+    }
+
+    /**
+     * OAuth 코드 입력 다이얼로그 표시
+     */
+    private fun showOAuthCodeInputDialog() {
+        val editText = android.widget.EditText(this).apply {
+            hint = "인증 코드 붙여넣기"
+            inputType = android.text.InputType.TYPE_CLASS_TEXT
+            setPadding(50, 30, 50, 30)
+        }
+
+        android.app.AlertDialog.Builder(this)
+            .setTitle("Claude 로그인")
+            .setMessage("브라우저에서 표시된 인증 코드를 붙여넣으세요")
+            .setView(editText)
+            .setPositiveButton("로그인") { _, _ ->
+                val code = editText.text.toString().trim()
+                if (code.isNotEmpty()) {
+                    exchangeOAuthCode(code)
+                } else {
+                    appendLog("[CLI] 코드가 비어있습니다", type = MessageType.SYSTEM)
+                }
+            }
+            .setNegativeButton("취소") { _, _ ->
+                appendLog("[CLI] 로그인 취소됨", type = MessageType.SYSTEM)
+            }
+            .show()
+    }
+
+    private fun exchangeOAuthCode(code: String) {
+        lifecycleScope.launch {
+            appendLog("[CLI] 토큰 교환 중...", type = MessageType.SYSTEM)
+            val success = claudeOAuth.exchangeCodeForToken(code)
+            if (success) {
+                appendLog("[CLI] 로그인 성공!", type = MessageType.SYSTEM)
+                // 토큰을 ClaudeBridge에 설정
+                claudeOAuth.getAccessToken()?.let { token ->
+                    claudeBridge.setApiKey(token)
+                    appendLog("[CLI] Claude 준비 완료!")
+                }
+            } else {
+                appendLog("[CLI] 로그인 실패 - 코드가 올바르지 않거나 만료됨", type = MessageType.SYSTEM)
+            }
+        }
+    }
+
+    override fun onNewIntent(intent: Intent?) {
+        super.onNewIntent(intent)
+        // OAuth callback 처리
+        intent?.data?.let { uri ->
+            if (uri.scheme == "naenwa" && uri.host == "oauth") {
+                lifecycleScope.launch {
+                    appendLog("[CLI] 로그인 처리 중...", type = MessageType.SYSTEM)
+                    val success = claudeOAuth.handleCallback(uri)
+                    if (success) {
+                        appendLog("[CLI] 로그인 성공!", type = MessageType.SYSTEM)
+                        // 토큰을 ClaudeBridge에 설정
+                        claudeOAuth.getAccessToken()?.let { token ->
+                            claudeBridge.setApiKey(token)
+                        }
+                    } else {
+                        appendLog("[CLI] 로그인 실패", type = MessageType.SYSTEM)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun sendToCLI(message: String) {
+        lifecycleScope.launch {
+            if (!bridgeInitialized) {
+                initializeClaudeBridge()
+                delay(1000)
+            }
+
+            // 스트리밍으로 전송
+            claudeBridge.sendPromptStreaming(message).collect { event ->
+                when (event) {
+                    is StreamEvent.Data -> {
+                        appendStream(event.content)
+                        saveClaudeOutput(event.content)
+                    }
+                    is StreamEvent.End -> {
+                        finishStreaming()
+                        showLoading(false)
+                        flushClaudeOutputBuffer()
+                    }
+                    is StreamEvent.Error -> {
+                        appendLog("[CLI 오류] ${event.message}", type = MessageType.SYSTEM)
+                        showLoading(false)
+                    }
+                }
+            }
+        }
+    }
+
+    private fun updateCLIModeUI(ready: Boolean) {
+        runOnUiThread {
+            binding.btnSend.isEnabled = ready || !useCLIMode
+            binding.tvStatus.text = if (ready) "CLI 준비됨" else "CLI 대기 중"
         }
     }
 
@@ -1166,17 +1439,52 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun requestPermissions() {
+        // 오디오 권한
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.RECORD_AUDIO)
             != PackageManager.PERMISSION_GRANTED
         ) {
             audioPermissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
         }
 
+        // 알림 권한 (Android 13+)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
             if (ContextCompat.checkSelfPermission(this, Manifest.permission.POST_NOTIFICATIONS)
                 != PackageManager.PERMISSION_GRANTED
             ) {
                 notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+            }
+        }
+
+        // 저장소 권한 (터미널 모드용 - 앱 삭제해도 Ubuntu 환경 유지)
+        requestStoragePermission()
+    }
+
+    private fun requestStoragePermission() {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+            // Android 11+ : MANAGE_EXTERNAL_STORAGE 권한 필요
+            if (!android.os.Environment.isExternalStorageManager()) {
+                AlertDialog.Builder(this)
+                    .setTitle("파일 접근 권한 필요")
+                    .setMessage("터미널 모드에서 Ubuntu 환경을 영구 저장하려면 파일 접근 권한이 필요합니다.\n\n이 권한을 허용하면 앱을 삭제해도 Ubuntu 환경이 유지됩니다.")
+                    .setPositiveButton("설정으로 이동") { _, _ ->
+                        val intent = Intent(Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION)
+                        intent.data = Uri.parse("package:$packageName")
+                        manageStorageLauncher.launch(intent)
+                    }
+                    .setNegativeButton("나중에", null)
+                    .show()
+            }
+        } else {
+            // Android 10 이하 : READ/WRITE_EXTERNAL_STORAGE 권한
+            val permissions = arrayOf(
+                Manifest.permission.READ_EXTERNAL_STORAGE,
+                Manifest.permission.WRITE_EXTERNAL_STORAGE
+            )
+            val needsPermission = permissions.any {
+                ContextCompat.checkSelfPermission(this, it) != PackageManager.PERMISSION_GRANTED
+            }
+            if (needsPermission) {
+                storagePermissionLauncher.launch(permissions)
             }
         }
     }
@@ -1242,6 +1550,14 @@ class MainActivity : AppCompatActivity() {
             // 연결 상태 UI 업데이트
             val isConnected = FloatingService.webSocketClient != null
             updateConnectionUI(isConnected)
+        }
+
+        // OAuth 코드 입력 대기 중이면 다이얼로그 표시
+        if (waitingForOAuthCode) {
+            waitingForOAuthCode = false
+            binding.root.postDelayed({
+                showOAuthCodeInputDialog()
+            }, 500)
         }
     }
 
